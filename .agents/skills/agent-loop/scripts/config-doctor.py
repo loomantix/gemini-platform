@@ -97,24 +97,62 @@ def doctor(project: Path, claude_effort: str | None) -> None:
         "gemini": values.get("gemini_review_hook", ""),
         "claude": values.get("claude_review_hook", ""),
     }
-    expected_hooks = {
-        "gemini": '"$AGENT_LOOP_AGY_REVIEW_LAUNCHER" --engine gemini',
-        "claude": '"$AGENT_LOOP_AGY_REVIEW_LAUNCHER" --engine claude',
-    }
-    for engine, expected in expected_hooks.items():
-        if hooks[engine] != expected:
-            raise DoctorError(f"{engine}_review_hook must use the dedicated Agy launcher")
+    if hooks["gemini"] != '"$AGENT_LOOP_AGY_REVIEW_LAUNCHER" --engine gemini':
+        raise DoctorError("gemini_review_hook must use the dedicated Agy launcher")
+
+    # The Claude lane has two legitimate runtimes, and the choice is an
+    # ENTITLEMENT question, not a preference. Agy exposes Claude models, but
+    # spending them draws on the Agy plan's allowance, which is provisioned for
+    # Gemini; a consumer whose plan carries no Anthropic allowance cannot use
+    # that path at all and must run the Claude CLI on its own entitlement.
+    claude_agy_hook = '"$AGENT_LOOP_AGY_REVIEW_LAUNCHER" --engine claude'
+    claude_cli_launcher = (
+        '"$AGENT_LOOP_TRUSTED_AGENTS_ROOT/skills/agent-loop/scripts/run-claude-review.sh"'
+    )
+    claude_hook = hooks["claude"]
+    claude_uses_agy = claude_hook == claude_agy_hook
+    claude_uses_cli = claude_hook.startswith(claude_cli_launcher)
+    if not claude_uses_agy and not claude_uses_cli:
+        raise DoctorError(
+            "claude_review_hook must use the dedicated Agy launcher or "
+            "run-claude-review.sh from the trusted agents root"
+        )
+    if claude_uses_cli:
+        # agent-loop.sh requires a non-builtin hook to name both contract
+        # variables, and run-claude-review.sh verifies the values it is handed
+        # against the environment. Check the hook string carries them so the
+        # failure lands here, at preflight, rather than mid-review.
+        for variable in (
+            "AGENT_LOOP_REVIEW_PUSH_HELPER",
+            "AGENT_LOOP_REVIEW_RESULT_FILE",
+        ):
+            if variable not in claude_hook:
+                raise DoctorError(f"claude_review_hook must pass ${variable}")
     if values.get("worker_hook", ""):
         if values.get("worker_fallback_model", ""):
             raise DoctorError("worker_fallback_model cannot be used with a custom worker_hook")
     elif not values.get("worker_model", ""):
         raise DoctorError("worker_model is required for the default Agy worker")
-    launcher_text = review_launcher.read_text(encoding="utf-8")
-    if claude_effort and not re.search(
-        rf'claude\) model="[^"]+"; effort="{re.escape(claude_effort)}"',
-        launcher_text,
-    ):
-        raise DoctorError(f"Agy review launcher must use literal Claude effort {claude_effort}")
+    # Agy encodes reasoning effort in the Gemini MODEL NAME and publishes no
+    # Claude effort variants, so `--effort` with a Claude model is rejected by
+    # the CLI outright. A claude_effort_policy is therefore unsatisfiable on the
+    # Agy path and must fail here rather than crashing the lane mid-run:
+    #   invalid model selection (--model "claude-sonnet-4-6" --effort "low"):
+    #   --effort is not supported for model "claude-sonnet-4-6"
+    if claude_effort and claude_uses_agy:
+        raise DoctorError(
+            "claude_effort_policy cannot be honoured by the Agy review launcher: "
+            "Agy supports no Claude effort variants. Leave it empty, or run the "
+            "Claude lane through run-claude-review.sh, which takes --effort."
+        )
+    # On the CLI path the policy IS honourable, so require the hook to pass it
+    # literally — an unenforced policy is not a policy.
+    if claude_effort and claude_uses_cli:
+        if f'--effort {claude_effort}' not in claude_hook:
+            raise DoctorError(
+                f"claude_review_hook must pass --effort {claude_effort} "
+                "to match claude_effort_policy"
+            )
 
 
 def main() -> int:

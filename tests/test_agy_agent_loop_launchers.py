@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 WORKER = ROOT / ".agents/skills/agent-loop/scripts/run-agy-worker.sh"
 REVIEW = ROOT / ".agents/skills/agent-loop/scripts/run-agy-review.sh"
+CLAUDE_REVIEW = ROOT / ".agents/skills/agent-loop/scripts/run-claude-review.sh"
 SHA = "a" * 40
 
 
@@ -149,6 +150,12 @@ def test_review_uses_truthful_engine_trusted_surface_and_fail_closed_json(
     prompt = argv[argv.index("--print") + 1]
     assert str(surface / "skills/deepcritique/SKILL.md") in prompt
     assert "engine gemini" in prompt
+    # The round is handed over and deepcritique resolves the stance from it
+    # (1-2 adversarial, 3+ convergence). Hardcoding convergence here cost three
+    # of the six review lanes and the refactor pass on EVERY round, including
+    # the first, which is the opposite of what the chain specifies.
+    assert "round 2" in prompt
+    assert "convergence mode" not in prompt
 
     result = subprocess.run(
         [str(REVIEW), "--engine", "claude"],
@@ -161,7 +168,14 @@ def test_review_uses_truthful_engine_trusted_surface_and_fail_closed_json(
     assert result.returncode == 0, result.stderr
     argv = json.loads(argv_file.read_text(encoding="utf-8"))
     assert argv[argv.index("--model") + 1] == "claude-sonnet-4-6"
-    assert argv[argv.index("--effort") + 1] == "low"
+    # Agy encodes effort in the Gemini model NAME and has no Claude effort
+    # variants, so passing --effort with a Claude model is rejected outright:
+    #   --effort is not supported for model "claude-sonnet-4-6"
+    # The previous expectation here asserted the flag WAS passed, which is why
+    # this suite stayed green while the lane could not start: the fake agy below
+    # accepts any flags, so a mock can never surface a real model/flag
+    # incompatibility. Assert the omission instead.
+    assert "--effort" not in argv
     assert argv[argv.index("--print-timeout") + 1] == "1800s"
     assert "engine claude" in argv[argv.index("--print") + 1]
 
@@ -254,3 +268,124 @@ def test_review_rejects_modified_trusted_surface_before_agy(tmp_path: Path) -> N
     assert result.returncode != 0
     assert "differs from the fetched base" in result.stderr
     assert not marker.exists()
+
+
+def _fake_claude(tmp_path: Path, subtype: str = "success", is_error: bool = False) -> tuple[Path, Path]:
+    argv_file = tmp_path / "claude-argv.json"
+    cli = _executable(
+        tmp_path / "claude",
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['CLAUDE_ARGV_FILE'], 'w', encoding='utf-8') as out:\n"
+        "    json.dump(sys.argv[1:], out)\n"
+        f"print(json.dumps({{'type': 'result', 'subtype': {subtype!r},"
+        f" 'is_error': {is_error!r}, 'result': 'complete'}}))\n",
+    )
+    return cli, argv_file
+
+
+def _claude_argv(tmp_path: Path) -> list[str]:
+    """The wrapper requires a non-builtin review hook to name both contract
+    variables, so the launcher takes them as arguments and checks them against
+    the environment."""
+    return [
+        str(CLAUDE_REVIEW),
+        "--push-helper", str(tmp_path / "review-push.sh"),
+        "--result-file", str(tmp_path / "review-result.json"),
+    ]
+
+
+def _claude_env(tmp_path: Path, surface: Path, cli: Path, argv_file: Path) -> dict[str, str]:
+    return {
+        **_subprocess_env(),
+        "CLAUDE_REVIEW_CLI": str(cli),
+        "CLAUDE_ARGV_FILE": str(argv_file),
+        "AGENT_LOOP_REVIEW_ENGINE": "claude",
+        "AGENT_LOOP_REVIEW_BASE_SHA": SHA,
+        "AGENT_LOOP_REVIEW_ROUND": "1",
+        "AGENT_LOOP_PR_NUMBER": "17",
+        "AGENT_LOOP_PR_HEAD_SHA": SHA,
+        "AGENT_LOOP_REVIEW_RESULT_FILE": str(tmp_path / "review-result.json"),
+        "AGENT_LOOP_REVIEW_PUSH_HELPER": str(tmp_path / "review-push.sh"),
+        "AGENT_LOOP_TRUSTED_AGENTS_ROOT": str(surface),
+        "AGENT_LOOP_TRUSTED_BASE_REF": "HEAD",
+    }
+
+
+def test_claude_review_runs_the_claude_cli_on_the_trusted_surface(tmp_path: Path) -> None:
+    """The Claude lane must run on the operator's own Claude entitlement.
+
+    Agy exposes Claude models, but spending them draws on the Agy plan's
+    allowance, which is provisioned for Gemini. This launcher exists so a
+    consumer without an Anthropic allowance on that plan still gets a second,
+    independent review engine.
+    """
+    _, surface = _trusted_surface(tmp_path)
+    issue = tmp_path / "issue"
+    issue.mkdir()
+    cli, argv_file = _fake_claude(tmp_path)
+
+    result = subprocess.run(
+        _claude_argv(tmp_path),
+        cwd=issue,
+        env=_claude_env(tmp_path, surface, cli, argv_file),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    argv = json.loads(argv_file.read_text(encoding="utf-8"))
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+    assert argv[argv.index("--add-dir") + 1] == str(surface)
+    assert argv[argv.index("--output-format") + 1] == "json"
+    # No model is pinned, so the operator's configured default is used and this
+    # launcher does not go stale when the model lineup moves.
+    assert "--model" not in argv
+    prompt = argv[argv.index("--print") + 1]
+    assert str(surface / "skills/deepcritique/SKILL.md") in prompt
+    assert "engine claude" in prompt
+    assert "convergence mode" not in prompt
+
+
+def test_claude_review_fails_closed_on_error_and_refusal(tmp_path: Path) -> None:
+    """Exit 0 is not success. A refusal reports subtype != success, and an
+    errored run can still exit 0 while setting is_error, so both are checked
+    independently rather than trusting the exit code."""
+    _, surface = _trusted_surface(tmp_path)
+    issue = tmp_path / "issue"
+    issue.mkdir()
+
+    for subtype, is_error, expected in (
+        ("error_max_turns", False, "subtype 'error_max_turns'"),
+        ("success", True, "is_error True"),
+    ):
+        cli, argv_file = _fake_claude(tmp_path, subtype=subtype, is_error=is_error)
+        result = subprocess.run(
+            _claude_argv(tmp_path),
+            cwd=issue,
+            env=_claude_env(tmp_path, surface, cli, argv_file),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode != 0, f"{subtype}/{is_error} should fail closed"
+        assert expected in result.stderr, result.stderr
+
+
+def test_claude_review_requires_the_trusted_surface(tmp_path: Path) -> None:
+    """The reviewer must never resolve its instructions from the issue worktree
+    the worker just wrote. Shared with the Agy launcher via review-surface.sh."""
+    _, surface = _trusted_surface(tmp_path)
+    cli, argv_file = _fake_claude(tmp_path)
+    env = _claude_env(tmp_path, surface, cli, argv_file)
+
+    result = subprocess.run(
+        _claude_argv(tmp_path),
+        cwd=surface,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "must be outside the issue worktree" in result.stderr
