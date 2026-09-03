@@ -165,6 +165,19 @@ targets:
     substitutions: []
     mode: '0755'
 
+  # Sourced by both review launchers, never executed directly.
+  - source: .agents/skills/agent-loop/scripts/review-surface.sh
+    destination: .agents/skills/agent-loop/scripts/review-surface.sh
+    substitutions: []
+    mode: '0644'
+
+  # The Claude review lane on the operator's own entitlement, for consumers
+  # whose Agy plan carries no Anthropic model allowance.
+  - source: .agents/skills/agent-loop/scripts/run-claude-review.sh
+    destination: .agents/skills/agent-loop/scripts/run-claude-review.sh
+    substitutions: []
+    mode: '0755'
+
   - source: .agents/skills/agent-loop/scripts/hook-git-guard
     destination: .agents/skills/agent-loop/scripts/hook-git-guard
     substitutions: []
